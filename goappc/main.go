@@ -56,6 +56,8 @@ func (v *assetsVisitor) rewriteCallExpr(node ast.Expr) ast.Expr {
 	}
 
 	filename := n.Args[0].(*ast.BasicLit).Value
+	filename = filename[1:len(filename)-1] // Strip quotes
+
 	hash := fmt.Sprintf("%x", md5.Sum([]byte(filename)))
 	ident := ast.NewIdent("Asset_" + hash[:16]) // 16 bytes ought to be enough.
 
@@ -126,6 +128,10 @@ func (v *assetsVisitor) Insert(file *ast.File) *ast.File {
 
 	ast.Walk(v, file)
 
+
+	var decls []ast.Decl
+	decls = append(decls, file.Decls[0])
+
 	// I'm so sorry about this entire for loop. Blame go/ast
 	for name, content := range v.rewritten {
 		elts := make([]ast.Expr, 0)
@@ -133,7 +139,7 @@ func (v *assetsVisitor) Insert(file *ast.File) *ast.File {
 			elts = append(elts, &ast.BasicLit{
 				ValuePos: token.NoPos,
 				Kind: token.INT,
-				Value: fmt.Sprintf("%x", b),
+				Value: fmt.Sprintf("%#.2x", b),
 			})
 		}
 
@@ -155,28 +161,45 @@ func (v *assetsVisitor) Insert(file *ast.File) *ast.File {
 		decl := &ast.GenDecl{
 			Doc: nil,
 			TokPos: token.NoPos,
-			Tok: token.CONST,
+			Tok: token.VAR,
 			Lparen: token.NoPos,
 			Specs: []ast.Spec{val},
 			Rparen: token.NoPos,
 		}
 
-		// Shoehorn ourselves up into the top of the file.
-		var decls []ast.Decl
-		decls = append(decls, file.Decls[0])
 		decls = append(decls, decl)
-		decls = append(decls, file.Decls[1:]...)
-
-		// Put the new []ast.Decl in place.
-		file.Decls = decls
 	}
+
+	// var _ = assets.Read (to silence unused imports)
+	underscore := &ast.GenDecl{
+		Doc: nil,
+		TokPos: token.NoPos,
+		Tok: token.VAR,
+		Lparen: token.NoPos,
+		Specs: []ast.Spec{
+			&ast.ValueSpec{
+				Names: []*ast.Ident{ast.NewIdent("_")},
+				Values: []ast.Expr{
+					&ast.SelectorExpr{
+						X: ast.NewIdent(v.importName),
+						Sel: ast.NewIdent("Read"),
+					},
+				},
+			},
+		},
+		Rparen: token.NoPos,
+	}
+
+	decls = append(decls, underscore)
+	decls = append(decls, file.Decls[1:]...)
+	file.Decls = decls // put our new []ast.Decl in place
 
 	return file
 }
 
 func main() {
 	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, os.Args[1], nil, parser.ParseComments)
+	f, err := parser.ParseFile(fset, os.Args[1], nil, 0)
 	if err != nil {
 		fmt.Println(err)
 		return

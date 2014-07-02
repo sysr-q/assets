@@ -7,66 +7,100 @@ import (
 	"go/printer"
 	"go/token"
 	"os"
-	"github.com/dchest/uniuri"
+	"io/ioutil"
+	"crypto/md5"
 )
 
 const assetsImport = `"github.com/sysr-q/assets"`
 
-type assetNode struct {
-	Contents []byte
-	Const *ast.Ident
-	Filename string
-}
-
 type assetsVisitor struct {
-	found map[ast.Node]assetNode // filename -> contents
 	importName string
-	looking bool
-	lookingPos ast.Node
-	pass bool // true = first, false = second
+	rewritten map[*ast.Ident][]byte // const ident -> contents
 }
 
-func (v *assetsVisitor) firstPass(node ast.Node) ast.Visitor {
-	switch n := node.(type) {
-	case *ast.Ident:
-		if n.Name == v.importName {
-			v.looking = true
-			// This is the node we found
-			v.lookingPos = n
-			break
-		}
-		if !v.looking || n.Name != "Read" && n.Name != "MustRead" {
-			v.looking = false
-			v.lookingPos = nil
-			break
-		}
-	case *ast.BasicLit:
-		if n.Kind != token.STRING || !v.looking {
-			break
-		}
-		v.found[v.lookingPos] = assetNode{
-			Contents: []byte(n.Value), // TODO(sysr-q): Actually add the contents of the file.
-			Const: ast.NewIdent("Assets_" + uniuri.New()),
-			Filename: n.Value,
-		}
-		fmt.Printf("found: %#v starting: %#v\n", n, v.lookingPos)
-		v.looking = false
-		v.lookingPos = nil
+func (v *assetsVisitor) assetsCallExpr(node ast.Node) bool {
+	n, ok := node.(*ast.CallExpr)
+	if !ok {
+		return false
 	}
-	return v
+
+	if len(n.Args) != 1	{
+		return false
+	}
+
+	fun, ok := n.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+
+	if x, ok := fun.X.(*ast.Ident); !ok || x.Name != v.importName {
+		return false
+	}
+
+	if fun.Sel.Name != "MustRead" && fun.Sel.Name != "Read" {
+		return false
+	}
+
+	return true
 }
 
-func (v *assetsVisitor) secondPass(node ast.Node) ast.Visitor {
-	switch n := node.(type) {
+func (v *assetsVisitor) rewriteCallExpr(node ast.Expr) ast.Expr {
+	// We assume this is only called on nodes which pass v.assetsCallExpr(node)
+	n, ok := node.(*ast.CallExpr)
+	if !ok {
+		return node
 	}
-	return v
+
+	if len(n.Args) != 1 {
+		return node
+	}
+
+	filename := n.Args[0].(*ast.BasicLit).Value
+	hash := fmt.Sprintf("%x", md5.Sum([]byte(filename)))
+	ident := ast.NewIdent("Asset_" + hash[:16]) // 16 bytes ought to be enough.
+
+	// TODO(sysr-q): This is rubbish.
+	for i := range v.rewritten {
+		if i.Name != ident.Name {
+			continue
+		}
+		return ident
+	}
+
+	f, err := os.Open(filename)
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(1) // RIP in peace.
+	}
+
+	b, err := ioutil.ReadAll(f)
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(1) // RIP^2
+	}
+
+	v.rewritten[ident] = b
+	return ident
 }
 
 func (v *assetsVisitor) Visit(node ast.Node) ast.Visitor {
-	if v.pass {
-		return v.firstPass(node)
+	switch n := node.(type) {
+	case *ast.CallExpr:
+		for i, arg := range n.Args {
+			if !v.assetsCallExpr(arg) {
+				continue
+			}
+			n.Args[i] = v.rewriteCallExpr(arg)
+		}
+	case *ast.AssignStmt:
+		for i, r := range n.Rhs {
+			if !v.assetsCallExpr(r) {
+				continue
+			}
+			n.Rhs[i] = v.rewriteCallExpr(r)
+		}
 	}
-	return v.secondPass(node)
+	return v
 }
 
 // Insert takes an *ast.File, walks through the ast of the file, replacing
@@ -90,15 +124,53 @@ func (v *assetsVisitor) Insert(file *ast.File) *ast.File {
 		return file
 	}
 
-	// First pass: identify ast nodes to replace
-	v.pass = true
 	ast.Walk(v, file)
 
-	// Second pass: walk through, replacing nodes
-	v.pass = false
-	ast.Walk(v, file)
+	// I'm so sorry about this entire for loop. Blame go/ast
+	for name, content := range v.rewritten {
+		elts := make([]ast.Expr, 0)
+		for _, b := range content {
+			elts = append(elts, &ast.BasicLit{
+				ValuePos: token.NoPos,
+				Kind: token.INT,
+				Value: fmt.Sprintf("%x", b),
+			})
+		}
 
-	fmt.Printf("%#v\n", v.found)
+		val := &ast.ValueSpec{
+			Names: []*ast.Ident{name},
+			Values: []ast.Expr{
+				&ast.CompositeLit{
+					Type: &ast.ArrayType{
+						Lbrack: token.NoPos,
+						Elt: ast.NewIdent("byte"),
+					},
+					Lbrace: token.NoPos,
+					Elts: elts,
+					Rbrace: token.NoPos,
+				},
+			},
+		}
+
+		decl := &ast.GenDecl{
+			Doc: nil,
+			TokPos: token.NoPos,
+			Tok: token.CONST,
+			Lparen: token.NoPos,
+			Specs: []ast.Spec{val},
+			Rparen: token.NoPos,
+		}
+
+		// Shoehorn ourselves up into the top of the file.
+		var decls []ast.Decl
+		decls = append(decls, file.Decls[0])
+		decls = append(decls, decl)
+		decls = append(decls, file.Decls[1:]...)
+
+		// Put the new []ast.Decl in place.
+		file.Decls = decls
+	}
+
 	return file
 }
 
@@ -111,14 +183,11 @@ func main() {
 	}
 
 	av := assetsVisitor{
-		found: make(map[ast.Node]assetNode),
-		importName: "",
+		rewritten: make(map[*ast.Ident][]byte),
 	}
 
 	f = av.Insert(f) // Where the magic happens.
-	//printer.Fprint(os.Stdout, fset, f)
-	_ = printer.Fprint
-	ast.Print(fset, f)
+	printer.Fprint(os.Stdout, fset, f)
 
 /*
 	pkgs, err := parser.ParseDir(fset, os.Args[1], nil, parser.ParseComments)

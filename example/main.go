@@ -6,6 +6,8 @@ import (
 	"net/http"
 )
 
+const Foo_1234 = []byte{0x01,0x02,0x03}
+
 func tmpl() *template.Template {
 	s := string(assets.MustRead("templates/layout.html"))
 	t := template.New("layout")
@@ -21,6 +23,9 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+	// /dev/null for you!
+	_ = string(assets.MustRead("templates/layout.html"))
+
 	http.HandleFunc("/", indexHandler)
 
 	http.ListenAndServe(":8080", nil)
